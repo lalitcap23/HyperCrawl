@@ -1,0 +1,14 @@
+[package]
+name = "rust_crawler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "gzip", "brotli", "cookies", "stream"] }
+scraper = "0.14"
+url = "2"
+futures = "0.3"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
