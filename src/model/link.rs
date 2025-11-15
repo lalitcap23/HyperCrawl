@@ -1,8 +1,35 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
+use uuid::Uuid;
 
-use super::{Image, Link, LinkId};
+use super::Image;
+
+// Type alias for Link ID
+pub type LinkId = Uuid;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Link {
+    pub id: LinkId,
+    pub url: String,
+    pub parents: Vec<LinkId>,
+    pub children: Vec<LinkId>,
+    pub images: Vec<Image>,
+    pub titles: Vec<String>,
+}
+
+impl Link {
+    pub fn new(url: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            url,
+            parents: Vec::new(),
+            children: Vec::new(),
+            images: Vec::new(),
+            titles: Vec::new(),
+        }
+    }
+}
 
 #[derive(Default, Debug, Serialize)]
 pub struct LinkGraph {
@@ -78,10 +105,7 @@ impl LinkGraph {
         let this_link_id = if let Some(link_id) = self.link_ids.get(url) {
             *link_id
         } else {
-            let new_link = Link {
-                url: url.to_string(),
-                ..Default::default()
-            };
+            let new_link = Link::new(url.to_string());
             let new_link_id = new_link.id;
 
             // add new link to the map, return its id
