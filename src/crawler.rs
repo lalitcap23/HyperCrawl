@@ -39,6 +39,7 @@ pub struct CrawlerState {
     pub link_queue: RwLock<VecDeque<LinkPath>>,
     pub link_graph: RwLock<LinkGraph>,
     pub max_links: usize,
+    pub base_domain: String,
 }
 
 pub type CrawlerStateRef = Arc<CrawlerState>;

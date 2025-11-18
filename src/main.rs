@@ -92,6 +92,21 @@ async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
         let LinkPath { parent, child } = link_queue.pop_back().unwrap_or(Default::default());
         drop(link_queue);
 
+        // Skip if child URL is empty
+        if child.is_empty() {
+            continue;
+        }
+
+        // Check if URL is within the base domain (domain restriction)
+        if let Ok(url) = Url::parse(&child) {
+            if let Some(domain) = url.domain() {
+                if domain != crawler_state.base_domain {
+                    info!("Skipping external domain: {} (not {})", domain, crawler_state.base_domain);
+                    continue 'crawler;
+                }
+            }
+        }
+
         // Log the errors
         let scrape_options = vec![ScrapeOption::Images, ScrapeOption::Titles];
         let scrape_output = scrape_page(Url::parse(&child)?, &client, &scrape_options).await;
@@ -99,12 +114,25 @@ async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
         let mut link_queue = crawler_state.link_queue.write().await;
         let mut link_graph = crawler_state.link_graph.write().await;
         for link in scrape_output.links.iter() {
-            if !link_graph.link_visited(link) {
+            // Check if link is within the base domain before adding to queue
+            let should_add = if let Ok(link_url) = Url::parse(link) {
+                if let Some(link_domain) = link_url.domain() {
+                    link_domain == crawler_state.base_domain
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_add && !link_graph.link_visited(link) {
                 // Check if the link already visited
                 link_queue.push_back(LinkPath {
                     parent: child.clone(),
                     child: link.clone(),
                 })
+            } else if !should_add {
+                info!("Skipping external link: {}", link);
             } else {
                 info!("Link already found: {}", &link);
             }
@@ -131,6 +159,12 @@ async fn serialize_links(links: &LinkGraph, destination: &str) -> Result<()> {
 }
 
 fn new_crawler_state(starting_url: String, max_links: u64) -> CrawlerStateRef {
+    // Extract base domain from starting URL
+    let base_domain = Url::parse(&starting_url)
+        .ok()
+        .and_then(|url| url.domain().map(|d| d.to_string()))
+        .unwrap_or_else(|| String::from("localhost"));
+
     let crawler_state = CrawlerState {
         link_queue: RwLock::new(VecDeque::from([LinkPath {
             child: starting_url,
@@ -138,6 +172,7 @@ fn new_crawler_state(starting_url: String, max_links: u64) -> CrawlerStateRef {
         }])),
         link_graph: RwLock::new(Default::default()),
         max_links: max_links as usize,
+        base_domain,
     };
 
     Arc::new(crawler_state)
