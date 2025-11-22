@@ -101,7 +101,10 @@ async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
         if let Ok(url) = Url::parse(&child) {
             if let Some(domain) = url.domain() {
                 if domain != crawler_state.base_domain {
-                    info!("Skipping external domain: {} (not {})", domain, crawler_state.base_domain);
+                    info!(
+                        "Skipping external domain: {} (not {})",
+                        domain, crawler_state.base_domain
+                    );
                     continue 'crawler;
                 }
             }

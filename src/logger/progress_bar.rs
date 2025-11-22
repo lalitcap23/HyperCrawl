@@ -4,7 +4,6 @@ pub struct ProgressBar {
     bar: indicatif::ProgressBar,
 }
 
-
 impl ProgressBar {
     pub fn new(total_steps: u64) -> Self {
         let bar = indicatif::ProgressBar::new(total_steps);
