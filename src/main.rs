@@ -19,11 +19,9 @@ use crate::{
     image_utils::{convert_links_to_images, download_images},
 };
 
-/// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct ProgramArgs {
-    /// Name of the person to greet
     #[arg(short, long)]
     starting_url: String,
 
@@ -77,49 +75,76 @@ async fn output_status(crawler_state: CrawlerStateRef, total_links: u64) -> Resu
 }
 
 async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
-    // one client per worker thread
     let client = Client::new();
 
-    // Crawler loop
     'crawler: loop {
         let number_links_found = crawler_state.link_graph.read().await.len();
         if number_links_found > crawler_state.max_links {
             break 'crawler;
         }
 
-        // also check that max links have been reached
         let mut link_queue = crawler_state.link_queue.write().await;
-        let LinkPath { parent, child } = link_queue.pop_back().unwrap_or(Default::default());
+        
+        if link_queue.is_empty() {
+            drop(link_queue);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            
+            let check_queue = crawler_state.link_queue.read().await;
+            if check_queue.is_empty() {
+                break 'crawler;
+            }
+            continue;
+        }
+        
+        let LinkPath { parent, child } = link_queue.pop_back().unwrap();
         drop(link_queue);
 
-        // Skip if child URL is empty
         if child.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
 
-        // Check if URL is within the base domain (domain restriction)
-        if let Ok(url) = Url::parse(&child) {
-            if let Some(domain) = url.domain() {
-                if domain != crawler_state.base_domain {
-                    info!(
-                        "Skipping external domain: {} (not {})",
-                        domain, crawler_state.base_domain
-                    );
+    
+        let parsed_url = match Url::parse(&child) {
+            Ok(url) => {
+                // Only allow HTTP and HTTPS
+                if !matches!(url.scheme(), "http" | "https") {
+                    info!("Skipping non-HTTP URL: {} (scheme: {})", child, url.scheme());
                     continue 'crawler;
                 }
+                url
+            }
+            Err(e) => {
+                info!("Skipping invalid URL: {} (error: {})", child, e);
+                continue 'crawler;
+            }
+        };
+
+        if let Some(domain) = parsed_url.domain() {
+            if domain != crawler_state.base_domain {
+                info!(
+                    "Skipping external domain: {} (not {})",
+                    domain, crawler_state.base_domain
+                );
+                continue 'crawler;
             }
         }
 
-        // Log the errors
+        // Scrape the page
         let scrape_options = vec![ScrapeOption::Images, ScrapeOption::Titles];
-        let scrape_output = scrape_page(Url::parse(&child)?, &client, &scrape_options).await;
+        let scrape_output = scrape_page(parsed_url.clone(), &client, &scrape_options).await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let mut link_queue = crawler_state.link_queue.write().await;
         let mut link_graph = crawler_state.link_graph.write().await;
         for link in scrape_output.links.iter() {
-            // Check if link is within the base domain before adding to queue
             let should_add = if let Ok(link_url) = Url::parse(link) {
-                if let Some(link_domain) = link_url.domain() {
+                // Check scheme is HTTP/HTTPS
+                if !matches!(link_url.scheme(), "http" | "https") {
+                    false
+                } else if let Some(link_domain) = link_url.domain() {
+                    // Check if same domain
                     link_domain == crawler_state.base_domain
                 } else {
                     false
@@ -129,13 +154,13 @@ async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
             };
 
             if should_add && !link_graph.link_visited(link) {
-                // Check if the link already visited
+                // Add to queue
                 link_queue.push_back(LinkPath {
                     parent: child.clone(),
                     child: link.clone(),
                 })
             } else if !should_add {
-                info!("Skipping external link: {}", link);
+                
             } else {
                 info!("Link already found: {}", &link);
             }
@@ -187,7 +212,6 @@ async fn try_main(args: ProgramArgs) -> Result<()> {
     // The actual crawling goes here
     let mut tasks = JoinSet::new();
 
-    // Add as many crawling workers as the user has specified
     for _ in 0..args.n_worker_threads {
         let crawler_state = crawler_state.clone();
         let task = tokio::spawn(async move { crawl(crawler_state.clone()).await });
@@ -207,7 +231,6 @@ async fn try_main(args: ProgramArgs) -> Result<()> {
             error!("Error: {:?}", e);
         }
     }
-    // FINISHED CRAWLING
 
     let link_graph = crawler_state.link_graph.read().await;
 
