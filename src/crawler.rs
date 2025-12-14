@@ -2,9 +2,17 @@ use anyhow::{anyhow, bail, Result};
 use log2::*;
 use reqwest::{Client, StatusCode};
 use scraper::{Html, Selector};
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::{Arc, atomic::AtomicUsize}, time::Duration};
 use tokio::sync::RwLock;
 use url::Url;
+
+pub fn create_client() -> Client {
+    Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; HyperCrawler/1.0)")
+        .timeout(Duration::from_secs(LINK_REQUEST_TIMEOUT_S))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
 
 use crate::model::Image;
 use crate::model::LinkGraph;
@@ -40,6 +48,7 @@ pub struct CrawlerState {
     pub link_graph: RwLock<LinkGraph>,
     pub max_links: usize,
     pub base_domain: String,
+    pub visited_count: Arc<AtomicUsize>,
 }
 
 pub type CrawlerStateRef = Arc<CrawlerState>;
@@ -120,11 +129,7 @@ async fn scrape_page_helper(
     client: &Client,
     options: &[ScrapeOption],
 ) -> Result<ScrapeOutput> {
-    let response = client
-        .get(url.clone())
-        .timeout(Duration::from_secs(LINK_REQUEST_TIMEOUT_S))
-        .send()
-        .await?;
+    let response = client.get(url.clone()).send().await?;
 
     if response.status() != StatusCode::OK {
         bail!("page returned invalid response");

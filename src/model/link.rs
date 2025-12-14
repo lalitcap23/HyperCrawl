@@ -1,21 +1,43 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::Image;
 
-// Type alias for Link ID
 pub type LinkId = Uuid;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Link {
     pub id: LinkId,
     pub url: String,
-    pub parents: Vec<LinkId>,
-    pub children: Vec<LinkId>,
+    #[serde(serialize_with = "serialize_hashset")]
+    pub parents: HashSet<LinkId>,
+    #[serde(serialize_with = "serialize_hashset")]
+    pub children: HashSet<LinkId>,
     pub images: Vec<Image>,
     pub titles: Vec<String>,
+}
+
+fn serialize_hashset<S>(set: &HashSet<LinkId>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let vec: Vec<&LinkId> = set.iter().collect();
+    vec.serialize(serializer)
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            url: String::new(),
+            parents: HashSet::new(),
+            children: HashSet::new(),
+            images: Vec::new(),
+            titles: Vec::new(),
+        }
+    }
 }
 
 impl Link {
@@ -23,8 +45,8 @@ impl Link {
         Self {
             id: Uuid::new_v4(),
             url,
-            parents: Vec::new(),
-            children: Vec::new(),
+            parents: HashSet::new(),
+            children: HashSet::new(),
             images: Vec::new(),
             titles: Vec::new(),
         }
@@ -59,32 +81,37 @@ impl LinkGraph {
         let link = self.force_get_link_id(url)?;
 
         if let Some(parent_id) = maybe_parent {
-            link.parents.push(parent_id);
+            link.parents.insert(parent_id);
         }
 
         link.children.extend(valid_children);
 
-        // TODO : reduce all these cloned (maybe use moved values)
-        link.images.extend(images.iter().cloned());
-        link.titles.extend(titles.iter().cloned());
+        let mut seen_images = HashSet::new();
+        for img in images {
+            if !seen_images.contains(&img.link) {
+                seen_images.insert(img.link.clone());
+                link.images.push(img.clone());
+            }
+        }
+
+        let mut seen_titles = HashSet::new();
+        for title in titles {
+            if !seen_titles.contains(title) {
+                seen_titles.insert(title.clone());
+                link.titles.push(title.clone());
+            }
+        }
+
         let this_link_id = link.id;
 
         if let Some(parent_id) = maybe_parent {
-            // Make changes to the parent here
-            // Get the parent link
-            // Add this child to the parent link
             let parent_link = self
                 .links
                 .get_mut(&parent_id)
                 .context("could not find parent link")?;
-
-            parent_link.children.push(this_link_id);
+            parent_link.children.insert(this_link_id);
         }
 
-        // Potentially there's a chance that we might visit the same
-        // link through different parents, meaning that we will get
-        // duplicated children, images, titles -> need a way to
-        // unduplicate all of this (I.e. use sets)
         Ok(())
     }
 

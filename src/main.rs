@@ -3,8 +3,7 @@ use clap::Parser;
 use log2::*;
 use logger::spinner::Colour;
 use model::LinkGraph;
-use reqwest::Client;
-use std::{collections::VecDeque, process, sync::Arc, time::Duration};
+use std::{collections::VecDeque, process, sync::Arc, sync::atomic::{AtomicUsize, Ordering}, time::Duration};
 use tokio::{fs, sync::RwLock, task::JoinSet};
 use url::Url;
 
@@ -74,63 +73,73 @@ async fn output_status(crawler_state: CrawlerStateRef, total_links: u64) -> Resu
     Ok(())
 }
 
+fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
+    url_domain == base_domain || url_domain.ends_with(&format!(".{}", base_domain))
+}
+
 async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
-    let client = Client::new();
+    let client = crawler::create_client();
 
     'crawler: loop {
-        let number_links_found = crawler_state.link_graph.read().await.len();
-        if number_links_found > crawler_state.max_links {
+        if crawler_state.visited_count.load(Ordering::Relaxed) >= crawler_state.max_links {
             break 'crawler;
         }
 
-        let mut link_queue = crawler_state.link_queue.write().await;
-        
-        if link_queue.is_empty() {
-            drop(link_queue);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            
-            let check_queue = crawler_state.link_queue.read().await;
-            if check_queue.is_empty() {
-                break 'crawler;
-            }
-            continue;
-        }
-        
-        let LinkPath { parent, child } = link_queue.pop_back().unwrap();
-        drop(link_queue);
+        let link_to_visit = {
+            let mut link_queue = crawler_state.link_queue.write().await;
+            link_queue.pop_back()
+        };
 
-        if child.is_empty() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
-
-    
-        let parsed_url = match Url::parse(&child) {
-            Ok(url) => {
-                // Only allow HTTP and HTTPS
-                if !matches!(url.scheme(), "http" | "https") {
-                    info!("Skipping non-HTTP URL: {} (scheme: {})", child, url.scheme());
-                    continue 'crawler;
+        let LinkPath { parent, child } = match link_to_visit {
+            Some(path) => path,
+            None => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let link_queue = crawler_state.link_queue.read().await;
+                if link_queue.is_empty() {
+                    break 'crawler;
                 }
-                url
-            }
-            Err(e) => {
-                info!("Skipping invalid URL: {} (error: {})", child, e);
-                continue 'crawler;
+                continue;
             }
         };
 
+        if child.is_empty() {
+            continue;
+        }
+
+        let parsed_url = match Url::parse(&child) {
+            Ok(mut url) => {
+                if !matches!(url.scheme(), "http" | "https") {
+                    continue 'crawler;
+                }
+                url.set_fragment(None);
+                url
+            }
+            Err(_) => continue 'crawler,
+        };
+
+        let normalized_url = parsed_url.to_string();
+
         if let Some(domain) = parsed_url.domain() {
-            if domain != crawler_state.base_domain {
-                info!(
-                    "Skipping external domain: {} (not {})",
-                    domain, crawler_state.base_domain
-                );
+            if !is_same_domain(domain, &crawler_state.base_domain) {
                 continue 'crawler;
             }
         }
 
-        // Scrape the page
+        let is_new = {
+            let link_graph = crawler_state.link_graph.read().await;
+            !link_graph.link_visited(&normalized_url)
+        };
+
+        if !is_new {
+            continue 'crawler;
+        }
+
+        if crawler_state.visited_count.load(Ordering::Relaxed) >= crawler_state.max_links {
+            break 'crawler;
+        }
+
+        crawler_state.visited_count.fetch_add(1, Ordering::Relaxed);
+
         let scrape_options = vec![ScrapeOption::Images, ScrapeOption::Titles];
         let scrape_output = scrape_page(parsed_url.clone(), &client, &scrape_options).await;
 
@@ -138,42 +147,44 @@ async fn crawl(crawler_state: CrawlerStateRef) -> Result<()> {
 
         let mut link_queue = crawler_state.link_queue.write().await;
         let mut link_graph = crawler_state.link_graph.write().await;
+        
         for link in scrape_output.links.iter() {
-            let should_add = if let Ok(link_url) = Url::parse(link) {
-                // Check scheme is HTTP/HTTPS
+            if crawler_state.visited_count.load(Ordering::Relaxed) >= crawler_state.max_links {
+                break;
+            }
+
+            let should_add = if let Ok(mut link_url) = Url::parse(link) {
                 if !matches!(link_url.scheme(), "http" | "https") {
                     false
-                } else if let Some(link_domain) = link_url.domain() {
-                    // Check if same domain
-                    link_domain == crawler_state.base_domain
                 } else {
-                    false
+                    link_url.set_fragment(None);
+                    let normalized = link_url.to_string();
+                    link_url.domain().map_or(false, |d| is_same_domain(d, &crawler_state.base_domain))
+                        && !link_graph.link_visited(&normalized)
                 }
             } else {
                 false
             };
 
-            if should_add && !link_graph.link_visited(link) {
-                // Add to queue
-                link_queue.push_back(LinkPath {
-                    parent: child.clone(),
-                    child: link.clone(),
-                })
-            } else if !should_add {
-                
-            } else {
-                info!("Link already found: {}", &link);
+            if should_add {
+                if let Ok(mut link_url) = Url::parse(link) {
+                    link_url.set_fragment(None);
+                    link_queue.push_back(LinkPath {
+                        parent: normalized_url.clone(),
+                        child: link_url.to_string(),
+                    });
+                }
             }
         }
 
         if let Err(e) = link_graph.update(
-            &child,
+            &normalized_url,
             &parent,
             &scrape_output.links,
             &scrape_output.images,
             &scrape_output.titles,
         ) {
-            error!("could not update the link graph with {:#?}", e);
+            error!("could not update the link graph: {}", e);
         }
     }
 
@@ -187,7 +198,6 @@ async fn serialize_links(links: &LinkGraph, destination: &str) -> Result<()> {
 }
 
 fn new_crawler_state(starting_url: String, max_links: u64) -> CrawlerStateRef {
-    // Extract base domain from starting URL
     let base_domain = Url::parse(&starting_url)
         .ok()
         .and_then(|url| url.domain().map(|d| d.to_string()))
@@ -201,6 +211,7 @@ fn new_crawler_state(starting_url: String, max_links: u64) -> CrawlerStateRef {
         link_graph: RwLock::new(Default::default()),
         max_links: max_links as usize,
         base_domain,
+        visited_count: Arc::new(AtomicUsize::new(0)),
     };
 
     Arc::new(crawler_state)

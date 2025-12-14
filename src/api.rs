@@ -13,7 +13,6 @@ use std::collections::HashMap;
 
 use crate::model::LinkGraph;
 
-/// Crawl job request
 #[derive(Debug, Deserialize)]
 pub struct CrawlRequest {
     pub url: String,

@@ -21,12 +21,15 @@ input:
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use log2::*;
 use reqwest::{Client, Response};
 use tokio::fs::{create_dir, File};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
+use tokio::time::sleep;
+use url::Url;
 use uuid::Uuid;
 
 use crate::model::{Image, LinkGraph};
@@ -41,46 +44,69 @@ pub fn convert_links_to_images(links: &LinkGraph) -> HashMap<String, Image> {
         .collect()
 }
 
-/// This function downloads one image into the destination
-/// using the tokio stream io extensions. Note that this
-/// contains modified code from https://gist.github.com/giuliano-oliveira/4d11d6b3bb003dba3a1b53f43d81b30d
-/// destination - the path to the destination without the extension!
 async fn download_image(link: &str, destination: &str, client: &Client) -> Result<()> {
-    // Download the image
+    const MAX_RETRIES: u32 = 3;
+    let mut last_error = None;
+
+    for attempt in 0..MAX_RETRIES {
+        match try_download_image(link, destination, client).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < MAX_RETRIES - 1 {
+                    sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("download failed after {} attempts", MAX_RETRIES)))
+}
+
+async fn try_download_image(link: &str, destination: &str, client: &Client) -> Result<()> {
     let res = client.get(link).send().await?;
-
-    // Get the content type here
     let extension = get_extension(&res)?;
-
-    let mut file = File::create(destination.to_string() + "." + extension).await?;
+    let mut file = File::create(format!("{}.{}", destination, extension)).await?;
     let mut stream = res.bytes_stream();
 
-    // download chunks
     while let Some(item) = stream.next().await {
-        let chunk = item?;
-        file.write_all(&chunk).await?;
+        file.write_all(&item?).await?;
     }
 
     Ok(())
 }
 
-fn get_extension(res: &Response) -> Result<&str> {
-    // Here where we can get the "content-type" and "image/gif"
-    let content_type = res
-        .headers()
-        .get("content-type")
-        .ok_or_else(|| anyhow!("failed to get content type"))?
-        .to_str()?;
-
-    match content_type {
-        "image/gif" => Ok("gif"),
-        "image/jpeg" => Ok("jpg"),
-        "image/png" => Ok("png"),
-        "image/svg+xml" => Ok("svg"),
-        "image/webp" => Ok("webp"),
-        "image/tiff" => Ok("tif"),
-        _ => bail!("unsupported extension type"),
+fn get_extension(res: &Response) -> Result<String> {
+    if let Some(content_type) = res.headers().get("content-type").and_then(|h| h.to_str().ok()) {
+        if let Some(ext) = match content_type {
+            "image/gif" => Some("gif"),
+            "image/jpeg" | "image/jpg" => Some("jpg"),
+            "image/png" => Some("png"),
+            "image/svg+xml" => Some("svg"),
+            "image/webp" => Some("webp"),
+            "image/tiff" | "image/tif" => Some("tif"),
+            "image/avif" => Some("avif"),
+            "image/bmp" => Some("bmp"),
+            _ => None,
+        } {
+            return Ok(ext.to_string());
+        }
     }
+
+    if let Ok(url) = res.url().as_str().parse::<Url>() {
+        if let Some(path) = url.path_segments() {
+            if let Some(last) = path.last() {
+                if let Some(dot_idx) = last.rfind('.') {
+                    let ext = &last[dot_idx + 1..];
+                    if !ext.is_empty() && ext.len() <= 5 {
+                        return Ok(ext.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
+    bail!("could not determine image extension")
 }
 
 /// Takes in the hashmap (image name, image info), downloads the images
